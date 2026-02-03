@@ -1,0 +1,141 @@
+name: Example - Remote Development with Keep Alive
+
+on:
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Services to monitor (comma-separated)'
+        required: false
+        default: 'tailscale'
+      interval:
+        description: 'Status interval (seconds)'
+        required: false
+        default: '300'
+      verbose:
+        description: 'Verbose output'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  remote-access:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max
+    
+    steps:
+      - name: 🚀 Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: 🔧 Setup Tailscale
+        uses: tailscale/github-action@main
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+      
+      - name: 📦 Setup Node.js (optional, for local package)
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      
+      - name: 🐳 Start Docker Services (optional)
+        run: |
+          # Example: start some docker containers
+          # docker-compose up -d
+          echo "Docker services would start here"
+      
+      - name: ⏳ Keep Workflow Alive
+        run: |
+          npx actions-keep-alive \
+            --interval ${{ github.event.inputs.interval }} \
+            --services ${{ github.event.inputs.services }} \
+            ${{ github.event.inputs.verbose == 'true' && '--verbose' || '' }}
+
+---
+# Alternative: Using npx without inputs
+name: Simple Keep Alive
+
+on:
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Keep Running
+        run: npx actions-keep-alive
+
+---
+# Alternative: With custom script
+name: Advanced Keep Alive
+
+on:
+  workflow_dispatch:
+
+jobs:
+  development:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    
+    steps:
+      - name: Setup Environment
+        run: |
+          # Install and setup your services here
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+      
+      - name: Custom Keep Alive Script
+        run: |
+          cat > keep-alive.sh << 'EOF'
+          #!/bin/bash
+          # Use keep-alive with custom settings
+          npx actions-keep-alive \
+            --interval 180 \
+            --services docker,ssh \
+            --message "Custom development environment running..." \
+            --verbose
+          EOF
+          
+          chmod +x keep-alive.sh
+          ./keep-alive.sh
+
+---
+# Windows Runner Example
+name: Windows Keep Alive
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-development:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      
+      - name: Keep Alive on Windows
+        run: npx actions-keep-alive --interval 300 --no-emoji
+        shell: cmd
+
+---
+# Multi-platform Example
+name: Cross-Platform Keep Alive
+
+on:
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    
+    steps:
+      - name: Keep Alive
+        run: npx actions-keep-alive --interval 300 --verbose
