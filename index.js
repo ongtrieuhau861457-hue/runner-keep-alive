@@ -1,4 +1,6 @@
-const { execSync, exec } = require("child_process");
+const { execSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
 const os = require("os");
 
 // Emoji maps
@@ -158,18 +160,247 @@ function checkSSH() {
 }
 
 /**
+ * Convert bytes to GB
+ */
+function bytesToGB(bytes) {
+  return Math.floor(bytes / 1024 / 1024 / 1024);
+}
+
+/**
+ * Get disk information for current working directory
+ */
+function getDiskInfo() {
+  try {
+    if (typeof fs.statfsSync === "function") {
+      const stats = fs.statfsSync(process.cwd());
+      const totalBytes = stats.blocks * stats.bsize;
+      const freeBytes = (stats.bavail || stats.bfree) * stats.bsize;
+
+      if (Number.isFinite(totalBytes) && totalBytes > 0) {
+        return {
+          total: bytesToGB(totalBytes),
+          free: bytesToGB(freeBytes),
+        };
+      }
+    }
+  } catch (error) {
+    // Fallback to shell commands below
+  }
+
+  if (os.platform() === "win32") {
+    const drive = path.parse(process.cwd()).root.replace(/\\/g, "").replace(/\//g, "");
+    const result = execCommand(`wmic logicaldisk where "DeviceID='${drive}'" get FreeSpace,Size /value`);
+
+    if (!result.success) {
+      return null;
+    }
+
+    const freeMatch = result.output.match(/FreeSpace=(\d+)/);
+    const totalMatch = result.output.match(/Size=(\d+)/);
+
+    if (!freeMatch || !totalMatch) {
+      return null;
+    }
+
+    return {
+      free: bytesToGB(Number(freeMatch[1])),
+      total: bytesToGB(Number(totalMatch[1])),
+    };
+  }
+
+  const result = execCommand("df -k .");
+  if (!result.success) {
+    return null;
+  }
+
+  const lines = result.output.split(/\r?\n/).filter(Boolean);
+  if (lines.length < 2) {
+    return null;
+  }
+
+  const parts = lines[1].trim().split(/\s+/);
+  const totalKb = Number(parts[1]);
+  const freeKb = Number(parts[3]);
+
+  if (!Number.isFinite(totalKb) || !Number.isFinite(freeKb)) {
+    return null;
+  }
+
+  return {
+    total: bytesToGB(totalKb * 1024),
+    free: bytesToGB(freeKb * 1024),
+  };
+}
+
+/**
+ * Get all non-internal IP addresses
+ */
+function getIPAddresses() {
+  const networkInterfaces = os.networkInterfaces();
+  const ips = new Set();
+
+  Object.values(networkInterfaces).forEach((entries) => {
+    (entries || []).forEach((entry) => {
+      if (!entry || entry.internal || !entry.address) {
+        return;
+      }
+      ips.add(entry.address);
+    });
+  });
+
+  return Array.from(ips).sort();
+}
+
+/**
+ * Build a directory tree for the current working directory
+ */
+function getDirectoryTree(rootPath = process.cwd(), maxDepth = 2, maxEntries = 120) {
+  let entryCount = 0;
+  let truncated = false;
+
+  const walk = (currentPath, prefix, depth) => {
+    if (depth > maxDepth || truncated) {
+      return [];
+    }
+
+    let entries = [];
+    try {
+      entries = fs
+        .readdirSync(currentPath, { withFileTypes: true })
+        .sort((a, b) => {
+          if (a.isDirectory() && !b.isDirectory()) {
+            return -1;
+          }
+          if (!a.isDirectory() && b.isDirectory()) {
+            return 1;
+          }
+          return a.name.localeCompare(b.name);
+        });
+    } catch (error) {
+      return [`${prefix}└── [permission denied]`];
+    }
+
+    const lines = [];
+    for (let i = 0; i < entries.length; i++) {
+      if (entryCount >= maxEntries) {
+        truncated = true;
+        break;
+      }
+
+      const entry = entries[i];
+      entryCount++;
+      const isLast = i === entries.length - 1;
+      const connector = isLast ? "└── " : "├── ";
+      lines.push(`${prefix}${connector}${entry.name}${entry.isDirectory() ? "/" : ""}`);
+
+      if (entry.isDirectory() && depth < maxDepth && !truncated) {
+        const childPrefix = `${prefix}${isLast ? "    " : "│   "}`;
+        const childLines = walk(path.join(currentPath, entry.name), childPrefix, depth + 1);
+        lines.push(...childLines);
+      }
+    }
+
+    return lines;
+  };
+
+  const rootName = path.basename(rootPath) || rootPath;
+  const treeLines = [`${rootName}/`, ...walk(rootPath, "", 0)];
+  if (truncated) {
+    treeLines.push("... (tree truncated)");
+  }
+
+  return treeLines.join("\n");
+}
+
+/**
+ * Get recent Docker logs using interval seconds
+ */
+function getDockerRecentLogs(intervalSeconds) {
+  if (!commandExists("docker")) {
+    return {
+      available: false,
+      error: "docker_not_installed",
+      output: null,
+    };
+  }
+
+  const safeInterval = Number.isFinite(intervalSeconds) && intervalSeconds > 0 ? Math.floor(intervalSeconds) : 300;
+  const composeCommand = `docker compose logs --since ${safeInterval}s --no-color`;
+  const composeResult = execCommand(composeCommand);
+
+  if (composeResult.success) {
+    return {
+      available: true,
+      source: "compose",
+      output: composeResult.output,
+      composeCommand,
+    };
+  }
+
+  // Fallback: show logs for all currently running containers
+  const containersResult = execCommand('docker ps --format "{{.Names}}"');
+  if (!containersResult.success) {
+    return {
+      available: false,
+      error: composeResult.error,
+      output: null,
+      composeCommand,
+    };
+  }
+
+  const containerNames = containersResult.output
+    .split("\n")
+    .map((name) => name.trim())
+    .filter(Boolean);
+
+  if (containerNames.length === 0) {
+    return {
+      available: true,
+      source: "docker",
+      output: "",
+      composeCommand,
+      composeError: composeResult.error,
+    };
+  }
+
+  const logs = [];
+  containerNames.forEach((containerName) => {
+    const containerResult = execCommand(`docker logs --since ${safeInterval}s --timestamps ${containerName}`);
+    if (!containerResult.success || !containerResult.output) {
+      return;
+    }
+
+    logs.push(`[${containerName}]`);
+    logs.push(containerResult.output);
+  });
+
+  return {
+    available: true,
+    source: "docker",
+    output: logs.join("\n").trim(),
+    composeCommand,
+    composeError: composeResult.error,
+  };
+}
+
+/**
  * Get system information
  */
 function getSystemInfo() {
+  const cwd = process.cwd();
   return {
     platform: os.platform(),
     arch: os.arch(),
     hostname: os.hostname(),
+    cwd,
     uptime: Math.floor(os.uptime()),
     memory: {
       total: Math.floor(os.totalmem() / 1024 / 1024 / 1024),
       free: Math.floor(os.freemem() / 1024 / 1024 / 1024),
     },
+    disk: getDiskInfo(),
+    ips: getIPAddresses(),
+    tree: getDirectoryTree(cwd),
     cpus: os.cpus().length,
   };
 }
@@ -221,9 +452,21 @@ function keepAlive(options = {}) {
     console.log(`${COLORS.blue}System Information:${COLORS.reset}`);
     console.log(`  Platform: ${sysInfo.platform} (${sysInfo.arch})`);
     console.log(`  Hostname: ${sysInfo.hostname}`);
+    console.log(`  CWD: ${sysInfo.cwd}`);
     console.log(`  CPUs: ${sysInfo.cpus}`);
     console.log(`  Memory: ${sysInfo.memory.free}GB free / ${sysInfo.memory.total}GB total`);
+    if (sysInfo.disk) {
+      console.log(`  Disk: ${sysInfo.disk.free}GB free / ${sysInfo.disk.total}GB total`);
+    } else {
+      console.log("  Disk: unavailable");
+    }
+    console.log(`  IPs: ${sysInfo.ips.length > 0 ? sysInfo.ips.join(", ") : "none"}`);
     console.log(`  Uptime: ${formatUptime(sysInfo.uptime)}\n`);
+    console.log("  CWD Tree:");
+    sysInfo.tree.split("\n").forEach((line) => {
+      console.log(`    ${line}`);
+    });
+    console.log("");
   }
 
   // Service checkers map
@@ -256,6 +499,7 @@ function keepAlive(options = {}) {
 
         const checker = serviceCheckers[service];
         const result = checker();
+        const normalizedStatus = String(result.status || "").toLowerCase();
 
         if (!result.available) {
           if (verbose) {
@@ -265,16 +509,16 @@ function keepAlive(options = {}) {
         }
 
         const statusEmoji =
-          result.status.includes("running") || result.status.includes("Running")
+          normalizedStatus.includes("running")
             ? emoji.check || "✓"
-            : result.status.includes("error")
+            : normalizedStatus.includes("error")
               ? emoji.cross || "✗"
               : emoji.info || "-";
 
         const statusColor =
-          result.status.includes("running") || result.status.includes("Running")
+          normalizedStatus.includes("running")
             ? COLORS.green
-            : result.status.includes("error")
+            : normalizedStatus.includes("error")
               ? COLORS.red
               : COLORS.yellow;
 
@@ -288,6 +532,31 @@ function keepAlive(options = {}) {
         }
 
         console.log(output);
+
+        if (service === "docker" && normalizedStatus.includes("running")) {
+          const dockerLogs = getDockerRecentLogs(interval);
+          console.log(`   ${emoji.docker || ""} docker compose logs --since ${interval}s:`);
+
+          if (!dockerLogs.available) {
+            console.log(`      ${emoji.warning || "!"} Unable to fetch docker logs`);
+            if (verbose && dockerLogs.error) {
+              console.log(`      ${dockerLogs.error}`);
+            }
+            return;
+          }
+
+          if (!dockerLogs.output) {
+            console.log("      (No new logs)");
+          } else {
+            dockerLogs.output.split(/\r?\n/).forEach((line) => {
+              console.log(`      ${line}`);
+            });
+          }
+
+          if (verbose && dockerLogs.source === "docker" && dockerLogs.composeError) {
+            console.log(`      ${emoji.info || "-"} docker compose unavailable, used docker logs fallback`);
+          }
+        }
       });
     }
 
