@@ -257,6 +257,7 @@ function getIPAddresses() {
 function getDirectoryTree(rootPath = process.cwd(), maxDepth = 2, maxEntries = 120) {
   let entryCount = 0;
   let truncated = false;
+  const ignoredNames = new Set([".git"]);
 
   const walk = (currentPath, prefix, depth) => {
     if (depth > maxDepth || truncated) {
@@ -267,6 +268,7 @@ function getDirectoryTree(rootPath = process.cwd(), maxDepth = 2, maxEntries = 1
     try {
       entries = fs
         .readdirSync(currentPath, { withFileTypes: true })
+        .filter((entry) => !ignoredNames.has(entry.name))
         .sort((a, b) => {
           if (a.isDirectory() && !b.isDirectory()) {
             return -1;
