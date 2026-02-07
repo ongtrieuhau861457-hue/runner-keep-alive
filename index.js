@@ -252,6 +252,57 @@ function getIPAddresses() {
 }
 
 /**
+ * Check if an IP is in Tailscale IPv4 CGNAT range (100.64.0.0/10)
+ */
+function isTailscaleIPv4(ip) {
+  if (!ip || !ip.includes(".")) {
+    return false;
+  }
+
+  const parts = ip.split(".").map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return false;
+  }
+
+  return parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
+}
+
+/**
+ * Check if an IP belongs to the Tailscale ULA prefix
+ */
+function isTailscaleIPv6(ip) {
+  return typeof ip === "string" && ip.toLowerCase().startsWith("fd7a:115c:a1e0:");
+}
+
+/**
+ * Get Tailscale IP addresses
+ */
+function getTailscaleIPs(allIps = []) {
+  const tailscaleIps = new Set();
+
+  if (commandExists("tailscale")) {
+    const result = execCommand("tailscale status --json");
+    if (result.success) {
+      try {
+        const status = JSON.parse(result.output);
+        const listedIps = status?.Self?.TailscaleIPs;
+        if (Array.isArray(listedIps)) {
+          listedIps
+            .map((ip) => String(ip).trim())
+            .filter(Boolean)
+            .forEach((ip) => tailscaleIps.add(ip));
+        }
+      } catch (error) {
+        // Ignore parse error and continue with fallback detection
+      }
+    }
+  }
+
+  allIps.filter((ip) => isTailscaleIPv4(ip) || isTailscaleIPv6(ip)).forEach((ip) => tailscaleIps.add(ip));
+  return Array.from(tailscaleIps);
+}
+
+/**
  * Build a directory tree for the current working directory
  */
 function getDirectoryTree(rootPath = process.cwd(), maxDepth = 2, maxEntries = 120) {
@@ -390,6 +441,7 @@ function getDockerRecentLogs(intervalSeconds) {
  */
 function getSystemInfo() {
   const cwd = process.cwd();
+  const ips = getIPAddresses();
   return {
     platform: os.platform(),
     arch: os.arch(),
@@ -401,7 +453,8 @@ function getSystemInfo() {
       free: Math.floor(os.freemem() / 1024 / 1024 / 1024),
     },
     disk: getDiskInfo(),
-    ips: getIPAddresses(),
+    ips,
+    tailscaleIps: getTailscaleIPs(ips),
     tree: getDirectoryTree(cwd),
     cpus: os.cpus().length,
   };
@@ -463,6 +516,7 @@ function keepAlive(options = {}) {
       console.log("  Disk: unavailable");
     }
     console.log(`  IPs: ${sysInfo.ips.length > 0 ? sysInfo.ips.join(", ") : "none"}`);
+    console.log(`  IP Tailscale: ${sysInfo.tailscaleIps.length > 0 ? sysInfo.tailscaleIps.join(", ") : "none"}`);
     console.log(`  Uptime: ${formatUptime(sysInfo.uptime)}\n`);
     console.log("  CWD Tree:");
     sysInfo.tree.split("\n").forEach((line) => {
